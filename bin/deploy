@@ -1,0 +1,122 @@
+#!/bin/bash
+
+set -e # EXIT on ANY error
+BASE_PATH=/var/www/html
+cd $BASE_PATH
+
+if [ -f ./app/etc/config.php ] || [ -f ./app/etc/env.php ]; then
+  echo "It appears Magento is already installed (app/etc/config.php or app/etc/env.php exist). Exiting setup..."
+  exit
+fi
+
+set -e # EXIT on ANY error
+NOW=$(date +"%Y-%m-%d-%H-%M")
+ProjectDir=$BASE_PATH
+ConfigPath=$ProjectDir/../.deploy/etc/.config
+
+if [ ! -f $ConfigPath ]; then
+    exit "NO VAR FILE FOUND"
+fi
+
+if [ -f $ProjectDir/.deploy/etc/env.php ] && [ ! -f $ProjectDir/.deploy/sql/dumps/$DBNAME.sql.gz ]; then
+    echo "Please provide database dump in ProjectDir/.deploy/sql/dumps/$DBNAME.sql.gz"
+    echo "Exiting setup..."
+    exit
+fi
+
+#LOADING VARS FROM FILE"
+source $ConfigPath
+echo "Start deploy $PROJECT.git"
+
+chmod 777 ./
+sudo chown $WWWUSER:$WWWGROUP /var/www
+
+#echo "change user to $WWWUSER"
+#mkdir -p /home/$WWWUSER/
+#mkdir -p /home/$WWWUSER/.composer
+#cp -rf /root/.ssh /home/$WWWUSER/
+#chown -R $WWWUSER:$WWWGROUP /home/$WWWUSER/.ssh
+#chmod 700 /home/$WWWUSER/.ssh
+#chown -R $WWWUSER:$WWWGROUP /home/$WWWUSER/.composer
+#chmod 700 /home/www-data/.composer/
+#id
+#exec sudo -u $WWWUSER /bin/bash - << eof
+#id
+
+echo "git clone before"
+git clone $GITUSER@$GITPROVIDER:$GITTEAMNAME/$PROJECT.git ./
+echo "git clone after"
+
+cd $ProjectDir
+git fetch --all
+git reset --hard HEAD
+git checkout $RELEASEBRANCH
+git pull
+
+export COMPOSER_PROCESS_TIMEOUT=3000
+
+curl -sS https://getcomposer.org/installer | php
+composer config -g github-oauth.github.com $GITHUBTOKEN
+composer config -g secure-http false
+composer run-script pre-install-cmd
+composer install
+
+echo "Applying ownership & proper permissions..."
+find . -type d -exec chmod 770 {} \; && find . -type f -exec chmod 660 {} \; && chmod u+x /usr/local/bin/php bin/magento
+
+if [ -f $ProjectDir/.deploy/etc/env.php ]; then
+    echo "Installing database from dump $ProjectDir/.deploy/sql/dumps/$DBNAME.sql.gz"
+
+    mysql -u$DBUSER -pDBPASSWORD -e "CREATE DATABASE $DBNAME CHARACTER SET utf8 COLLATE utf8_general_ci";
+    gunzip $ProjectDir/.deploy/sql/dumps/$DBNAME.sql.gz
+    mysql -u$DBUSER -pDBPASSWORD $DBNAME < $ProjectDir/.deploy/sql/dumps/$DBNAME.sql
+
+    echo "Copy env.php file to app/etc"
+    cp $ProjectDir/.deploy/etc/env.php ./app/etc
+
+    #TODO change db hostname, disable production extensions and accounts
+else
+    echo "Running Magento 2 setup script..."
+    /usr/local/bin/php ./bin/magento setup:install \
+        --db-host=$DBHOST \
+        --db-name=$DBNAME \
+        --db-user=$DBUSER \
+        --db-password=DBPASSWORD \
+        --base-url=$M2BASEURL \
+        --admin-firstname=$M2ADMINFIRSTNAME \
+        --admin-lastname=$M2ADMINLASTNAME \
+        --admin-email=$M2ADMINEMAIL \
+        --admin-user=$M2ADMINUSER \
+        --admin-password=$M2ADMINPASSWORD \
+        --language=$M2LANGUAGE \
+        --currency=$M2CURRENCY \
+        --timezone=$M2TIMEZONE \
+fi
+
+echo "Generate modules in config.php..."
+/usr/local/bin/php ./bin/magento module:enable --all
+
+echo "Run post install cmd..."
+composer run-script post-install-cmd
+
+echo "Clean cache..."
+rm -rf var/cache/* var/page_cache/* var/generation/*
+
+echo "Setup upgrade and dicompile..."
+/usr/local/bin/php -d memory_limit=1512M ./bin/magento setup:upgrade
+/usr/local/bin/php -d memory_limit=1512M ./bin/magento setup:di:compile
+
+echo "Set magento2 deploy mode to $DEPLOYMODE"
+/usr/local/bin/php -d memory_limit=1512M ./bin/magento deploy:mode:set $DEPLOYMODE --skip-compilation
+
+echo "Deploying static view files..."
+/usr/local/bin/php -d memory_limit=1512M ./bin/magento setup:static-content:deploy en_US
+
+echo "Applying ownership & proper permissions..."
+chmod -R 777 $ProjectDir/var/
+chmod -R 777 $ProjectDir/pub/
+
+echo "The setup script has completed execution."
+
+exit 0
+eof
